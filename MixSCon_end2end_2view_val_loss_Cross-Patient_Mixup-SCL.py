@@ -1,20 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-Optimal MM-SCL for LUAD (Patient-aware + Adaptive MixSCL + (opt) Cosine Classifier + Weak Proto/Align)
-- Dataset layout: CV_ROOT/Round{1..5}/(train|val)/{1_acinar,...,6_solid}, and TEST_ROOT with same class dirs
-- Patient proxy: filename prefix before first '_' (e.g., CASE123_*.png) treated as patient/WSI id
+Optimal MixSCon for LUAD (Patient-aware + Adaptive MixSCL + (Optional) Cosine Classifier)
 
-Train loss:
-    L_total = L_SCL(patient-aware) + beta * L_MixSCL(adaptive, cross-patient preferred)
-              + gamma * L_CE + lambda_proto * L_proto + lambda_align * L_align
+Dataset layout:
+    CV_ROOT/Round{1..5}/(train|val)/{1_acinar,...,6_solid}
+    TEST_ROOT with identical class subdirectories
 
-Validation/Early stop: CE-only (logits) for stability (unchanged from baseline)
+Patient proxy:
+    The filename prefix before the first underscore (e.g., CASE123_*.png) is used as patient/WSI ID.
+
+Training loss:
+    L_total = L_SCL(patient-aware) + beta * L_MixSCL(adaptive, cross-patient preferred) + gamma * L_CE
+
+Validation / Early Stop:
+    CE-only on logits for stable validation feedback (same as baseline)
 
 Saved artifacts per round:
-    best_model_round_X.pth (with optimizer), final_weights_round_X.pth (state_dict),
-    checkpoint_round_X.pth (meta), confusion_matrix_round_X.png, training_history_round_X.png,
+    best_model_round_X.pth (with optimizer state),
+    final_weights_round_X.pth (state_dict only),
+    checkpoint_round_X.pth (full metadata),
+    confusion_matrix_round_X.png,
+    training_history_round_X.png,
     results_round_X.json
-And CV summary: best_overall_model.pth, cross_validation_results.json
+
+Cross-validation summary:
+    best_overall_model.pth (selected by highest test accuracy across rounds),
+    cross_validation_results.json
 """
 
 import os, json, time, shutil, math
@@ -44,61 +55,56 @@ except Exception:
 # Config
 # =========================
 CONFIG = {
-    # 학습/손실 가중치
+    # Training / loss weights
     'epochs': 200,
     'patience': 30,
     'batch_size': 32,
     'lr': 1e-3,
     'weight_decay': 1e-4,
 
-    # temperatures
+    # Temperatures
     'temperature_scl': 0.07,   # SupCon / MixSCL
-    'temperature_proto': 0.07, # Prototype softmax
-    'temperature_cls': 0.07,   # (옵션) cosine classifier
+    'temperature_cls': 0.07,   # (optional) cosine classifier
 
-    # 손실 가중치
-    'beta': 1.0,           # Mixup-SCL
-    'gamma': 1.0,          # CE
-    'lambda_proto': 0.10,  # Prototype (weak)
-    'lambda_align': 0.10,  # Alignment (weak, optional; set 0 to disable)
+    # Loss coefficients
+    'beta': 1.0,               # Mixup-SCL
+    'gamma': 1.0,              # CE
 
-    # patient-aware re-weight for SupCon
+    # Patient-aware weighting
     'w_same_patient': 1.0,
     'w_cross_patient': 1.8,
 
-    # Adaptive Mixup 세부
-    'mix_beta_alpha': 0.5,   # initial Beta(alpha,alpha) draw (used only if need)
-    'mix_kappa': 0.5,        # lambda = clip(0.5 + kappa*(0.5 - distance), eps, 1-eps)
-    'mix_eps': 0.05,         # lambda clip
-    'prefer_cross_patient_for_mix': True,   # cross-patient pair 우선
-    'prefer_same_class_for_mix': True,      # same-class pair 우선
+    # Adaptive Mixup parameters
+    'mix_beta_alpha': 0.5,     # initial Beta(alpha,alpha) (fallback only)
+    'mix_kappa': 0.5,          # lambda = clip(0.5 + kappa*(0.5 - distance), eps, 1-eps)
+    'mix_eps': 0.05,           # clipping epsilon
+    'prefer_cross_patient_for_mix': True,
+    'prefer_same_class_for_mix': True,
 
-    # 모델
+    # Model
     'backbone': 'resnet50',
-    'use_timm': False,  # True면 timm 백본 사용
+    'use_timm': False,
     'proj_dim': 128,
-    'use_cosine_classifier': True,  # 분류 헤드를 cosine classifier로
-    'use_align_loss': True,         # L_align 활성화 여부
+    'use_cosine_classifier': True,
 
-    # 증강
-    'two_views': True,   # train에서만 2-view (SupCon)
+    # Augmentations
+    'two_views': True,
     'color_jitter': (0.2, 0.2, 0.2, 0.05),
     'gaussian_blur_p': 0.2,
     'hflip_p': 0.5,
     'vflip_p': 0.5,
     'rot90': True,
 
-    # 기타
+    # Misc
     'num_workers': 4,
     'pin_memory': True,
     'min_delta': 1e-4,
-    'proto_momentum': 0.99,  # EMA for prototypes
     'seed': 2025,
 }
 
 
 # =========================
-# Utils: seed
+# Seed utilities
 # =========================
 def set_seed(seed: int = 2025):
     import random
@@ -134,7 +140,7 @@ def build_train_transforms(cfg: Dict):
         transforms.RandomVerticalFlip(p=cfg['vflip_p']),
         RandomRotate90(enable=cfg['rot90']),
         transforms.Resize((224, 224)),
-        #transforms.Resize((512, 512)),
+        # transforms.Resize((512, 512)),
         transforms.ToTensor(),
         _normalize_tfm(),
     ]
@@ -148,21 +154,18 @@ def build_train_transforms(cfg: Dict):
 def build_eval_transform():
     return transforms.Compose([
         transforms.Resize((224, 224)),
-        #transforms.Resize((512, 512)),
+        # transforms.Resize((512, 512)),
         transforms.ToTensor(),
         _normalize_tfm(),
     ])
 
 
 # =========================
-# Dataset wrappers (return patient id)
+# Dataset wrappers (include patient ID)
 # =========================
 def _extract_patient_id_from_path(path: str) -> str:
-    # 파일명 접두가 "CASE_xxx_..." 형태라고 가정 (CSV 기반 생성 스크립트 전제)
-    # 접두(첫 '_' 이전)를 환자/WSI proxy로 사용
     name = Path(path).name
     stem = Path(path).stem
-    # robust: split by '_' and take first token; if none, fall back to stem
     if '_' in name:
         return stem.split('_')[0]
     return stem
@@ -177,9 +180,9 @@ class ImageFolderWithPatient(datasets.ImageFolder):
         return img, y, patient
 
 class TwoViewDatasetWithPatient(Dataset):
-    """같은 원본에서 2-view + patient id 반환"""
+    """Return two independent augmented views + patient ID."""
     def __init__(self, folder: datasets.ImageFolder, t1: transforms.Compose, t2: transforms.Compose):
-        self.base = folder  # base.samples 사용 (path, label)
+        self.base = folder
         self.t1 = t1
         self.t2 = t2
         self.samples = self.base.samples
@@ -195,7 +198,7 @@ class TwoViewDatasetWithPatient(Dataset):
 
 
 # =========================
-# Dataloaders (with patient ids)
+# Dataloaders
 # =========================
 def make_loaders_for_round(round_dir: Path, test_dir: Path, cfg: Dict) -> Tuple[DataLoader, DataLoader, DataLoader, int, List[str]]:
     train_t1, train_t2 = build_train_transforms(cfg)
@@ -222,9 +225,10 @@ def make_loaders_for_round(round_dir: Path, test_dir: Path, cfg: Dict) -> Tuple[
 
 
 # =========================
-# Model (proj head + (opt) cosine classifier)
+# Model
 # =========================
 class End2EndBackbone(nn.Module):
+    """Backbone + projection head + (optional) cosine classifier."""
     def __init__(self, num_classes: int, out_dim: int = 128, backbone: str = 'resnet50',
                  use_timm: bool = False, use_cosine_classifier: bool = True, tau_cls: float = 0.07):
         super().__init__()
@@ -239,7 +243,7 @@ class End2EndBackbone(nn.Module):
             self.backbone = timm.create_model(backbone, pretrained=True, num_classes=0)
             feat_dim = self.backbone.num_features
         else:
-            assert backbone == 'resnet50', "Only torchvision resnet50 unless use_timm=True"
+            assert backbone == 'resnet50'
             rn = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
             self.conv1, self.bn1, self.relu, self.maxpool = rn.conv1, rn.bn1, rn.relu, rn.maxpool
             self.layer1, self.layer2, self.layer3, self.layer4 = rn.layer1, rn.layer2, rn.layer3, rn.layer4
@@ -250,7 +254,6 @@ class End2EndBackbone(nn.Module):
         self.proj_head = nn.Linear(feat_dim, out_dim)
 
         if use_cosine_classifier:
-            # weight only, no bias
             self.cls_weight = nn.Parameter(torch.empty(num_classes, feat_dim))
             nn.init.kaiming_normal_(self.cls_weight, nonlinearity='linear')
         else:
@@ -293,41 +296,10 @@ class End2EndBackbone(nn.Module):
             return self.cls_head(feat)
 
     def forward(self, x):
-        feat = self._forward_feat(x)                       # (B, 2048)
-        proj = F.normalize(self.proj_head(feat), dim=1)    # (B, D=128)
-        logits = self._cls_logits(feat)                    # (B, C)
+        feat = self._forward_feat(x)
+        proj = F.normalize(self.proj_head(feat), dim=1)
+        logits = self._cls_logits(feat)
         return proj, logits, feat
-
-
-# =========================
-# Prototype Bank (EMA in projection space)
-# =========================
-class PrototypeEMA(nn.Module):
-    def __init__(self, num_classes: int, dim: int, momentum: float = 0.99):
-        super().__init__()
-        self.C = num_classes
-        self.D = dim
-        self.m = momentum
-        self.register_buffer("protos", torch.zeros(num_classes, dim))
-        self.register_buffer("init_mask", torch.zeros(num_classes, dtype=torch.bool))
-
-    @torch.no_grad()
-    def update(self, z: torch.Tensor, y: torch.Tensor):
-        # z: (B,D), normalized; y: (B,)
-        for c in torch.unique(y):
-            c = int(c.item())
-            mask = (y == c)
-            if mask.any():
-                zc = F.normalize(z[mask].mean(dim=0, keepdim=False), dim=0)
-                if not self.init_mask[c]:
-                    self.protos[c] = zc
-                    self.init_mask[c] = True
-                else:
-                    self.protos[c] = F.normalize(self.m*self.protos[c] + (1-self.m)*zc, dim=0)
-
-    def get(self):
-        # if some classes never updated, keep zeros (ignored by CE since those classes won't appear)
-        return F.normalize(self.protos, dim=1)
 
 
 # =========================
@@ -340,7 +312,9 @@ def _mask_diagonal_for_softmax(sim: torch.Tensor) -> torch.Tensor:
 def patient_aware_supcon(z: torch.Tensor, y: torch.Tensor, patients: List[str],
                          tau: float, w_same: float, w_cross: float) -> torch.Tensor:
     """
-    z: (B,D) normalized proj, y: (B,), patients: list/tuple length B
+    Patient-aware weighted supervised contrastive loss.
+    Assigns different weights to same-class pairs depending on
+    whether they originate from the same patient or different patients.
     """
     B = z.size(0)
     sim = (z @ z.T) / max(tau, 1e-12)
@@ -348,31 +322,23 @@ def patient_aware_supcon(z: torch.Tensor, y: torch.Tensor, patients: List[str],
     logp = F.log_softmax(sim, dim=1)
 
     y = y.view(-1,1)
-    pos = (y == y.T).float().to(z.device)  # same-class
+    pos = (y == y.T).float().to(z.device)
 
-    # patient matrix
     same_patient = torch.zeros(B, B, device=z.device, dtype=torch.bool)
-    # build boolean by comparing strings; do on CPU then to device for efficiency if needed
     pids = list(patients)
     for i in range(B):
-        pi = pids[i]
         for j in range(B):
-            if i == j: continue
-            if pids[j] == pi:
+            if i != j and pids[j] == pids[i]:
                 same_patient[i, j] = True
 
-    # weights
     omega = torch.where(same_patient, torch.tensor(w_same, device=z.device), torch.tensor(w_cross, device=z.device)).float()
 
-    # remove diagonal in pos mask
     eye = torch.eye(B, device=z.device)
     pos = pos * (1 - eye)
-
-    # weighted positives
     weighted_pos = omega * pos
+
     denom = weighted_pos.sum(dim=1).clamp(min=1e-12)
     loss_i = -(logp * weighted_pos).sum(dim=1) / denom
-    # if no positives (rare), set zero
     zero_row = (pos.sum(dim=1) == 0)
     loss_i = torch.where(zero_row, torch.zeros_like(loss_i), loss_i)
     return loss_i.mean()
@@ -380,17 +346,15 @@ def patient_aware_supcon(z: torch.Tensor, y: torch.Tensor, patients: List[str],
 def _choose_mix_partner(y: torch.Tensor, patients: List[str],
                         prefer_cross_patient: bool = True, prefer_same_class: bool = True) -> torch.Tensor:
     """
-    For each i, choose partner j with priority:
-      1) same class & different patient
-      2) same class (any patient)
-      3) any (different class)
-    Returns partner indices (B,) on CPU; convert to device outside.
+    Partner selection priority:
+        1) same class AND different patient
+        2) same class
+        3) any sample
     """
     B = y.size(0)
     pids = list(patients)
-    partner = torch.arange(B)  # init with self; we'll overwrite
+    partner = torch.arange(B)
 
-    # indices by class
     cls_to_indices = {}
     for i in range(B):
         cls_to_indices.setdefault(int(y[i].item()), []).append(i)
@@ -400,23 +364,20 @@ def _choose_mix_partner(y: torch.Tensor, patients: List[str],
         cand = []
 
         if prefer_same_class:
-            # same class
             same_class = cls_to_indices.get(yi, [])
             if prefer_cross_patient:
-                # cross-patient within same-class
                 cand = [j for j in same_class if j != i and pids[j] != pids[i]]
             if not cand:
                 cand = [j for j in same_class if j != i]
+
         if not cand:
-            # fallback: any different class
             cand = [j for j in range(B) if j != i]
 
-        # pick one at random
         if cand:
             partner[i] = np.random.choice(cand)
         else:
-            # degenerate: only self
             partner[i] = i
+
     return partner
 
 def adaptive_mixscl(z: torch.Tensor, y: torch.Tensor, patients: List[str],
@@ -424,30 +385,29 @@ def adaptive_mixscl(z: torch.Tensor, y: torch.Tensor, patients: List[str],
                     kappa: float = 0.5, eps: float = 0.05,
                     prefer_cross_patient: bool = True, prefer_same_class: bool = True) -> torch.Tensor:
     """
-    Build mixed representation z_mix_i = lambda_i * z_i + (1-lambda_i) * z_j
-    where partner j is chosen with cross-patient (and same-class) preference.
-    lambda_i = clip(0.5 + kappa*(0.5 - d_ij), eps, 1-eps), d_ij = (1 - cos)/2 in [0,1]
-    Loss = soft-label SupCon: compare z_mix against base z with soft mask y_soft.
+    Adaptive MixSCL:
+        z_mix_i = λ_i*z_i + (1-λ_i)*z_j
+        λ_i = clip(0.5 + kappa*(0.5 - d_ij), eps, 1-eps)
+        d_ij = (1 - cos(z_i,z_j)) / 2
+        Uses soft labels based on mixing proportions.
     """
     device = z.device
     B, D = z.size()
     partner = _choose_mix_partner(y, patients, prefer_cross_patient, prefer_same_class).to(device)
     z_j = z[partner]
-    # cosine sim in [-1,1]
+
     cos_ij = (z * z_j).sum(dim=1).clamp(-1+1e-6, 1-1e-6)
-    d_ij = (1 - cos_ij) * 0.5  # in [0,1]
+    d_ij = (1 - cos_ij) * 0.5
     lam = torch.clamp(0.5 + kappa * (0.5 - d_ij), eps, 1 - eps).view(B, 1)
 
     z_mix = lam * z + (1 - lam) * z_j
 
-    # soft labels
     y_one = F.one_hot(y, num_classes=num_classes).float()
     y_partner = F.one_hot(y[partner], num_classes=num_classes).float()
-    y_soft = lam * y_one + (1 - lam) * y_partner     # (B,C)
+    y_soft = lam * y_one + (1 - lam) * y_partner
 
-    # SupCon-style with soft positive mask: pos_mask[i,:] = y_soft[i] dotted with one-hot of batch labels
-    labels_onehot_batch = F.one_hot(y, num_classes=num_classes).float()  # (B,C)
-    pos_mask = y_soft @ labels_onehot_batch.T                             # (B,B)
+    labels_onehot_batch = F.one_hot(y, num_classes=num_classes).float()
+    pos_mask = y_soft @ labels_onehot_batch.T
 
     sim = (z_mix @ z.T) / max(tau, 1e-12)
     sim = _mask_diagonal_for_softmax(sim)
@@ -458,28 +418,18 @@ def adaptive_mixscl(z: torch.Tensor, y: torch.Tensor, patients: List[str],
 
     denom = pos_mask.sum(dim=1).clamp(min=1e-12)
     loss_i = -(logp * pos_mask).sum(dim=1) / denom
+
     zero_row = (pos_mask.sum(dim=1) == 0)
     loss_i = torch.where(zero_row, torch.zeros_like(loss_i), loss_i)
     return loss_i.mean()
 
-def proto_loss(z: torch.Tensor, y: torch.Tensor, protos: torch.Tensor, tau_p: float) -> torch.Tensor:
-    # z: (B,D) normalized, protos: (C,D) normalized
-    logits = (z @ protos.T) / max(tau_p, 1e-12)
-    return F.cross_entropy(logits, y)
-
-def align_loss(z: torch.Tensor, feat: torch.Tensor) -> torch.Tensor:
-    # z normalized already; feat: (B,F) -> normalize then 1 - cosine
-    f_n = F.normalize(feat, dim=1)
-    cos = (z * f_n[:, :z.size(1)]).sum(dim=1).clamp(-1+1e-6, 1-1e-6)
-    return (1 - cos).mean()
-
 
 # =========================
-# Train / Validate / Test
+# Training / Validation / Test
 # =========================
-def train_one_epoch(model, loader, optimizer, device, num_classes, cfg: Dict, proto_bank: Optional[PrototypeEMA]):
+def train_one_epoch(model, loader, optimizer, device, num_classes, cfg: Dict):
     model.train()
-    total = {'loss':0.0, 'scl':0.0, 'mix':0.0, 'ce':0.0, 'proto':0.0, 'align':0.0}
+    total = {'loss':0.0, 'scl':0.0, 'mix':0.0, 'ce':0.0}
     n = 0
 
     pbar = tqdm(loader, desc="Train", leave=False)
@@ -487,7 +437,7 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, cfg: Dict, pr
         optimizer.zero_grad(set_to_none=True)
 
         if cfg['two_views']:
-            v1, v2, labels, patients = batch  # patients: tuple/list of strings length B
+            v1, v2, labels, patients = batch
             v1, v2 = v1.to(device), v2.to(device)
             labels = labels.to(device)
             patients = list(patients)
@@ -501,9 +451,8 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, cfg: Dict, pr
             labels_dup = labels
             patients_dup = patients
 
-        proj, logits, feat = model(images)  # proj normalized (by us), logits, feat raw
+        proj, logits, feat = model(images)
 
-        # 1) patient-aware SupCon (two-views가 있으면 concat된 proj/labels_dup/patients_dup로)
         L_scl = patient_aware_supcon(
             proj, labels_dup, patients_dup,
             tau=cfg['temperature_scl'],
@@ -511,8 +460,6 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, cfg: Dict, pr
             w_cross=cfg['w_cross_patient']
         )
 
-        # 2) adaptive MixSCL (use single-view subset to avoid duplicate strength bias)
-        #    - 여기서는 첫 half (v1) 기준으로 mix; two_views=False면 전체 사용
         if cfg['two_views']:
             B = labels.size(0)
             z_base = proj[:B]
@@ -531,7 +478,6 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, cfg: Dict, pr
             prefer_same_class=cfg['prefer_same_class_for_mix']
         )
 
-        # 3) CE (분류 로짓)
         if cfg['two_views']:
             l1, l2 = torch.chunk(logits, 2, dim=0)
             L_ce = 0.5 * (F.cross_entropy(l1, labels) + F.cross_entropy(l2, labels))
@@ -540,32 +486,7 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, cfg: Dict, pr
             L_ce = F.cross_entropy(logits, labels)
             bs = labels.size(0)
 
-        # 4) Prototype (weak)
-        if proto_bank is not None:
-            with torch.no_grad():
-                # update prototypes using the whole proj (incl. two views)
-                hard_labels_for_update = labels_dup  # use hard labels
-                proto_bank.update(proj.detach(), hard_labels_for_update.detach())
-            protos = proto_bank.get().to(device)
-            # use first view for L_proto to align scale; both also ok
-            L_proto = proto_loss(z_base, y_base, protos, tau_p=cfg['temperature_proto'])
-        else:
-            L_proto = torch.tensor(0.0, device=device)
-
-        # 5) Alignment (weak, optional)
-        if cfg['use_align_loss']:
-            # align first-view proj and corresponding feat
-            if cfg['two_views']:
-                feat_base = feat[:bs]
-                z_for_align = z_base
-            else:
-                feat_base = feat
-                z_for_align = proj
-            L_align = align_loss(z_for_align, feat_base)
-        else:
-            L_align = torch.tensor(0.0, device=device)
-
-        loss = L_scl + cfg['beta']*L_mix + cfg['gamma']*L_ce + cfg['lambda_proto']*L_proto + cfg['lambda_align']*L_align
+        loss = L_scl + cfg['beta']*L_mix + cfg['gamma']*L_ce
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
@@ -574,18 +495,16 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, cfg: Dict, pr
         total['scl']   += float(L_scl.item()) * bs
         total['mix']   += float(L_mix.item()) * bs
         total['ce']    += float(L_ce.item())  * bs
-        total['proto'] += float(L_proto.item())* bs
-        total['align'] += float(L_align.item())* bs
         n += bs
 
         pbar.set_postfix(loss=f"{total['loss']/max(n,1):.4f}")
 
-    return (total['loss']/n, total['scl']/n, total['mix']/n, total['ce']/n, total['proto']/n, total['align']/n)
+    return (total['loss']/n, total['scl']/n, total['mix']/n, total['ce']/n)
 
 @torch.no_grad()
 def validate(model, loader, device, cfg: Dict):
     """
-    ✅ 검증 손실은 CE만 사용 (contrastive/aux 제거) — baseline과 동일 정책
+    Validation loss uses CE-only (contrastive losses excluded).
     """
     model.eval()
     total_loss = 0.0
@@ -633,7 +552,7 @@ def test_eval(model, loader, device, class_names: List[str]) -> Dict:
 
 
 # =========================
-# Utils: Plot & Save (same as baseline)
+# Plot & Save
 # =========================
 def plot_confusion_matrix(cm, class_names, round_num, save_dir: Path):
     plt.figure(figsize=(10, 8))
@@ -675,7 +594,7 @@ class EarlyStopping:
 
 
 # =========================
-# Train one Round
+# Train one round
 # =========================
 def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root: Path, cfg: Dict) -> Dict:
     print(f"\n{'='*70}\nTRAINING ROUND {round_num}\n{'='*70}")
@@ -685,18 +604,14 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
     round_dir = cv_root / f'Round{round_num}'
     train_loader, val_loader, test_loader, num_classes, class_names = make_loaders_for_round(round_dir, test_root, cfg)
 
-    # 모델/옵티마이저
     model = End2EndBackbone(num_classes=num_classes, out_dim=cfg['proj_dim'],
                             backbone=cfg['backbone'], use_timm=cfg['use_timm'],
                             use_cosine_classifier=cfg['use_cosine_classifier'],
                             tau_cls=cfg['temperature_cls']).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
 
-    # Prototype bank
-    proto_bank = PrototypeEMA(num_classes=num_classes, dim=cfg['proj_dim'], momentum=cfg['proto_momentum']).to(device)
-
     early_stopping = EarlyStopping(patience=cfg['patience'], min_delta=cfg['min_delta'])
-    history = dict(train_total=[], train_scl=[], train_mix=[], train_ce=[], train_proto=[], train_align=[],
+    history = dict(train_total=[], train_scl=[], train_mix=[], train_ce=[],
                    val_loss=[], val_acc=[])
 
     best_val = float('inf'); best_val_acc = 0.0
@@ -704,8 +619,8 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
 
     start = time.time()
     for ep in range(1, cfg['epochs']+1):
-        tr_tot, tr_scl, tr_mix, tr_ce, tr_proto, tr_align = train_one_epoch(
-            model, train_loader, optimizer, device, num_classes, cfg, proto_bank
+        tr_tot, tr_scl, tr_mix, tr_ce = train_one_epoch(
+            model, train_loader, optimizer, device, num_classes, cfg
         )
         va_loss, va_acc = validate(model, val_loader, device, cfg)
 
@@ -713,16 +628,12 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
         history['train_scl'].append(tr_scl)
         history['train_mix'].append(tr_mix)
         history['train_ce'].append(tr_ce)
-        history['train_proto'].append(tr_proto)
-        history['train_align'].append(tr_align)
         history['val_loss'].append(va_loss)
         history['val_acc'].append(va_acc)
 
         print(f"Epoch {ep:03d} | Train: total={tr_tot:.4f} | SCL={tr_scl:.4f} Mix={tr_mix:.4f} "
-              f"CE={tr_ce:.4f} Proto={tr_proto:.4f} Align={tr_align:.4f} | "
-              f"Val: loss={va_loss:.4f}, acc={va_acc:.2f}%")
+              f"CE={tr_ce:.4f} | Val: loss={va_loss:.4f}, acc={va_acc:.2f}%")
 
-        # best 저장 (val loss 기준)
         if best_val - va_loss > cfg['min_delta']:
             best_val = va_loss
             torch.save({
@@ -735,23 +646,21 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
                 'num_classes': num_classes,
                 'backbone': cfg['backbone'],
             }, best_path)
-            print(f"  ✅ Saved best checkpoint to {best_path}")
+            print(f"  Saved best checkpoint to {best_path}")
 
-        # best acc 추적
         if va_acc > best_val_acc:
             best_val_acc = va_acc
 
-        # Early stopping on val loss
         if early_stopping(va_loss, model):
-            print(f"⛳ Early stopping at epoch {ep}")
+            print(f"Early stopping at epoch {ep}")
             break
 
     train_time = time.time() - start
     print(f"Training time: {train_time/60:.2f} min | Best Val Acc: {best_val_acc:.2f}%")
 
-    # 최종/체크포인트 저장
     final_weights_path = save_root / f'final_weights_round_{round_num}.pth'
     torch.save(model.state_dict(), final_weights_path)
+
     ckpt_path = save_root / f'checkpoint_round_{round_num}.pth'
     torch.save({
         'round': round_num,
@@ -765,16 +674,13 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
         'num_classes': num_classes
     }, ckpt_path)
 
-    # EarlyStopping best weights로 테스트
     if early_stopping.best_weights is not None:
         model.load_state_dict(early_stopping.best_weights, strict=True)
         model.to(device)
 
-    # 테스트
     print("Evaluating on Test set...")
     test_res = test_eval(model, test_loader, device, class_names)
 
-    # 결과 저장
     results = {
         'round': round_num,
         'best_val_acc': best_val_acc,
@@ -790,7 +696,6 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
         'class_names': class_names
     }
 
-    # 플롯/JSON 저장
     save_training_history(history, round_num, save_root)
     plot_confusion_matrix(test_res['confusion_matrix'], class_names, round_num, save_root)
     with open(save_root / f'results_round_{round_num}.json', 'w') as f:
@@ -828,7 +733,6 @@ def run_cross_validation(cv_root: str, test_root: str, save_root: str, cfg: Dict
         print("No successful rounds. Exiting.")
         return
 
-    # 요약 통계
     metrics = ['test_accuracy', 'test_precision', 'test_recall', 'test_f1']
     overall_stats = {}
     print("\nOVERALL RESULTS")
@@ -842,7 +746,6 @@ def run_cross_validation(cv_root: str, test_root: str, save_root: str, cfg: Dict
                " ".join([f"{v:<8.4f}" for v in overall_stats[m]['values']])
         print(line)
 
-    # best overall: 각 라운드의 best 체크포인트 기준
     best_round = max(all_results, key=lambda r: r['test_accuracy'])
     best_round_num = best_round['round']; best_acc = best_round['test_accuracy']
     print(f"\nBest round: Round {best_round_num} (Acc: {best_acc:.4f})")
@@ -851,7 +754,6 @@ def run_cross_validation(cv_root: str, test_root: str, save_root: str, cfg: Dict
         shutil.copy2(src, save_root / 'best_overall_model.pth')
         print("Saved: best_overall_model.pth")
 
-    # 전체 결과 저장
     summary = {
         'config': cfg,
         'individual_results': all_results,
@@ -870,60 +772,20 @@ def run_cross_validation(cv_root: str, test_root: str, save_root: str, cfg: Dict
 
 
 # =========================
-# Main (경로만 환경에 맞게 수정)
+# Main
 # =========================
 if __name__ == "__main__":
     CV_ROOT  = "/home/sj-baek/Manifold_Mixco/LUAD_Dataset_CV"
     TEST_ROOT= "/home/sj-baek/Manifold_Mixco/LUAD_Dataset_CV/test"
-    BASE_SAVE = "/home/sj-baek/Manifold_Mixco/LUAD_ASAN/Optimal_MM_SCL_cv_results_multi"
+    BASE_SAVE = "/home/sj-baek/Manifold_Mixco/LUAD_ASAN/Optimal_MM_SCL_cv_results_multi_Pure"
 
-    # 세 실험 설정 정의
-    experiments = [
-        {
-            "name": "Exp1_Pure",
-            "desc": "L_SCL(patient) + β L_MixSCL(cross) + γ L_CE",
-            "lambda_proto": 0.0,
-            "lambda_align": 0.0,
-            "use_align_loss": False,
-        },
-        {
-            "name": "Exp2_Proto",
-            "desc": "L_SCL(patient) + β L_MixSCL(cross) + γ L_CE + λ_p L_proto",
-            "lambda_proto": CONFIG["lambda_proto"],  # 기존 값 사용 (0.10)
-            "lambda_align": 0.0,
-            "use_align_loss": False,
-        },
-        {
-            "name": "Exp3_Align",
-            "desc": "L_SCL(patient) + β L_MixSCL(cross) + γ L_CE + λ_a L_align",
-            "lambda_proto": 0.0,
-            "lambda_align": CONFIG["lambda_align"],  # 기존 값 사용 (0.10)
-            "use_align_loss": True,
-        },
-    ]
+    save_dir = Path(BASE_SAVE)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-    # 전체 실행
-    for exp in experiments:
-        print("\n" + "="*90)
-        print(f"▶ Running {exp['name']}: {exp['desc']}")
-        print("="*90)
-
-        # 개별 실험용 config 복사
-        cfg = CONFIG.copy()
-        cfg["lambda_proto"] = exp["lambda_proto"]
-        cfg["lambda_align"] = exp["lambda_align"]
-        cfg["use_align_loss"] = exp["use_align_loss"]
-        cfg["use_align_loss"] = exp["use_align_loss"]
-
-        save_dir = Path(BASE_SAVE) / exp["name"]
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        run_cross_validation(CV_ROOT, TEST_ROOT, save_dir, cfg)
+    run_cross_validation(CV_ROOT, TEST_ROOT, save_dir, CONFIG)
 
     print("\n" + "="*80)
-    print("✅ All three experiments finished successfully.")
+    print("Experiment Completed: SCL + β MixSCL + γ CE")
     print("="*80)
     print("Results saved under:")
-    print(f"  {BASE_SAVE}/Exp1_Pure/")
-    print(f"  {BASE_SAVE}/Exp2_Proto/")
-    print(f"  {BASE_SAVE}/Exp3_Align/")
+    print(f"  {BASE_SAVE}/")
