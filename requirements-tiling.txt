@@ -1,0 +1,4 @@
+# Optional: only needed to extract tiles directly from WSIs.
+openslide-python==1.4.2
+openslide-bin==4.0.0.8
+shapely==2.0.7

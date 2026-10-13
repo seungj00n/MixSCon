@@ -1,0 +1,23 @@
+{
+  "class_order": [
+    "acinar",
+    "cribriform",
+    "lepidic",
+    "micropapillary",
+    "papillary",
+    "solid"
+  ],
+  "checkpoints": {
+    "resnet50": "resnet50.pth",
+    "vit16": "vit16.pth",
+    "ding": [
+      "ding_ssl1.pth",
+      "ding_ssl2.pth",
+      "ding_ssl3.pth"
+    ],
+    "alsubaie": "alsubaie.pth",
+    "cellomaps": "cellomaps.pth",
+    "mixscon_ce": "mixscon_ce.pth",
+    "mixscon_fl": "mixscon_fl.pth"
+  }
+}

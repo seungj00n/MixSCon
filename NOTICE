@@ -1,0 +1,12 @@
+The MIT license covers code authored by the MixSCon contributors. External
+packages, upstream code, datasets and pretrained weights retain their own terms.
+No upstream source tree, dataset or pretrained weights are bundled here.
+
+Local baseline implementations follow these methods, with study-specific adaptations:
+Ding et al.: https://github.com/rina-ding/ssl_luad_classification
+CellOMaps: https://github.com/Arwa-AlRubaian/CellOMaps
+Alsubaie et al.: https://doi.org/10.1109/ACCESS.2023.3251220
+ResNet: https://github.com/pytorch/vision
+ViT: https://github.com/huggingface/pytorch-image-models
+
+These local implementations are not advertised as unmodified upstream code.
