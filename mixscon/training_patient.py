@@ -743,7 +743,7 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
                 'num_classes': num_classes,
                 'backbone': cfg['backbone'],
             }, best_path)
-            print(f"  ✅ Saved best checkpoint to {best_path}")
+            print(f"  [INFO] Saved best checkpoint to {best_path}")
 
         # best acc 추적
         if va_acc > best_val_acc:
@@ -751,7 +751,7 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
 
         # Early stopping on val loss
         if early_stopping(va_loss, model):
-            print(f"⛳ Early stopping at epoch {ep}")
+            print(f"[INFO] Early stopping at epoch {ep}")
             break
 
     train_time = time.time() - start

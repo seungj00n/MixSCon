@@ -3,7 +3,40 @@ from pathlib import Path
 import csv
 
 CLASSES = ['acinar', 'cribriform', 'lepidic', 'micropapillary', 'papillary', 'solid']
+CLASS_FOLDERS = [f'{i + 1}_{name}' for i, name in enumerate(CLASSES)]
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
+
+def class_index(name):
+    """Map class names (including ImageFolder prefixes) to fixed six-class IDs."""
+    name = str(name).strip().lower()
+    prefix, separator, suffix = name.partition('_')
+    if separator and prefix.isdigit():
+        name = suffix
+    if name not in CLASSES:
+        raise ValueError(f'Unknown growth-pattern class: {name!r}')
+    return CLASSES.index(name)
+
+def evaluation_label(value):
+    """Accept fixed IDs 0..5 or class names, never compact five-class indices."""
+    value = str(value).strip()
+    if value.lstrip('+-').isdigit():
+        return label_number(value)
+    return class_index(value)
+
+def map_labels(dataset, fixed_classes=CLASS_FOLDERS):
+    """Remap an ImageFolder by class name, retaining the absent Cribriform slot."""
+    if [class_index(name) for name in fixed_classes] != list(range(len(CLASSES))):
+        raise ValueError('fixed_classes must follow the documented six-class order.')
+    mapped = [class_index(name) for name in dataset.classes]
+    if len(set(mapped)) != len(mapped):
+        raise ValueError('Multiple folders refer to the same class.')
+    samples = [(path, mapped[index]) for path, index in dataset.samples]
+    dataset.samples = samples
+    dataset.imgs = samples
+    dataset.targets = [index for _, index in samples]
+    dataset.classes = list(fixed_classes)
+    dataset.class_to_idx = {name: i for i, name in enumerate(fixed_classes)}
+    return dataset
 
 def read_manifest(path, required):
     with Path(path).open(encoding='utf-8-sig', newline='') as stream:

@@ -12,7 +12,6 @@ Saved artifacts:
 - checkpoint_round_X.pth        : full checkpoint per round
 - confusion_matrix_round_X.png, training_history_round_X.png
 - results_round_X.json
-- best_overall_model.pth        : best model among 5 folds based on test accuracy
 - cross_validation_results.json : cross-validation summary
 """
 
@@ -481,13 +480,13 @@ def train_single_round(round_num: int, cv_root: Path, test_root: Path, save_root
                 'num_classes': num_classes,
                 'backbone': cfg['backbone'],
             }, best_path)
-            print(f"  ✓ Saved best checkpoint to {best_path}")
+            print(f"  [INFO] Saved best checkpoint to {best_path}")
 
         if va_acc > best_val_acc:
             best_val_acc = va_acc
 
         if early_stopping(va_loss, model):
-            print(f"⛳ Early stopping at epoch {ep}")
+            print(f"[INFO] Early stopping at epoch {ep}")
             break
 
     train_time = time.time() - start

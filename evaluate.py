@@ -2,7 +2,7 @@
 import argparse
 import json
 from pathlib import Path
-from mixscon.data import CLASSES, read_manifest, label_number, image_path
+from mixscon.data import CLASSES, CLASS_FOLDERS, read_manifest, evaluation_label, image_path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -42,9 +42,10 @@ def main():
         if not row['sample_id'] or row['sample_id'] in seen:
             parser.error('Empty or duplicate sample_id.')
         seen.add(row['sample_id'])
-        row['label'] = label_number(row['label'])
+        row['label'] = evaluation_label(row['label'])
         if args.cohort == 'TCGA' and row['label'] == 1:
-            parser.error('The study TCGA protocol has no Cribriform reference labels.')
+            parser.error('TCGA has no Cribriform reference labels. Use class names or fixed IDs '
+                         '0,2,3,4,5, not ImageFolder indices 0..4.')
         for field, needed in [('raw_path', any(n != 'cellomaps' for n in names)), ('cellmap_path', 'cellomaps' in names)]:
             if needed:
                 row[field] = str(image_path(row[field], args.data_root or args.manifest.resolve().parent))
@@ -74,8 +75,14 @@ def main():
             raise ValueError('Invalid probability matrix for ' + name)
         predicted = probs.argmax(1)
         metrics.append({'cohort': args.cohort, 'model': name, 'tiles': len(labels), **metric_values(labels, probs, present)})
-        columns = [c for c in ['sample_id', 'patient_id', 'wsi_id', 'label'] if c in frame]
+        columns = [c for c in ['sample_id', 'patient_id', 'wsi_id', 'label', 'x', 'y'] if c in frame]
         predictions = frame[columns].copy()
+        # Retain filenames/coordinates for WSI overlays and spreadsheet analysis.
+        path_column = 'cellmap_path' if name == 'cellomaps' else 'raw_path'
+        predictions['filename'] = frame[path_column].map(lambda p: Path(p).name)
+        predictions['true'] = [CLASS_FOLDERS[i] for i in labels]
+        predictions['pred'] = [CLASS_FOLDERS[i] for i in predicted]
+        predictions['confidence score'] = probs.max(axis=1)
         for i, cls in enumerate(CLASSES):
             predictions['prob_' + cls] = probs[:, i]
         predictions['predicted_label'] = predicted

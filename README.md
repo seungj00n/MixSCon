@@ -1,5 +1,7 @@
 # MixSCon
 
+MixSCon classifies six lung adenocarcinoma growth patterns using patient-aware mixup and supervised contrastive learning.
+
 Code for *MixSCon: Manifold mix up-based supervised contrastive learning for robust histopathological pattern classification*.
 
 ## Environment
@@ -16,7 +18,7 @@ python -m pip install torch==2.0.1 torchvision==0.15.2 --index-url https://downl
 python -m pip install -r requirements.txt
 ```
 
-For CPU, replace `cu118` with `cpu`. Training downloads ImageNet weights unless cached. For WSI extraction, also install `requirements-tiling.txt`.
+For CPU, replace `cu118` with `cpu`. Training downloads ImageNet weights unless cached. WSI extraction and overlays also require `python -m pip install -r requirements-tiling.txt`.
 
 ## Directory structure
 
@@ -27,6 +29,7 @@ evaluate.py            Tile evaluation and ROC curves
 mixscon/ baselines/     Model and training code
 preprocessing/         Tile extraction and split preparation
 analysis/              WSI bootstrap and plots
+ablation/              Six-component ablation training and external evaluation
 configs/ splits/       Settings and manifest templates
 data/ weights/ outputs/ Local inputs and results (Git-ignored)
 ```
@@ -34,7 +37,7 @@ data/ weights/ outputs/ Local inputs and results (Git-ignored)
 ## Data preparation
 
 - AMC images, annotations, identifiers and split membership remain private. Prepare manifests locally using authorized data.
-- TCGA slides: [GDC](https://portal.gdc.cancer.gov/); pattern masks: [CellOMaps](https://github.com/Arwa-AlRubaian/CellOMaps).
+- TCGA: all 46 TCGA-LUAD slides with masks in [CellOMaps](https://github.com/Arwa-AlRubaian/CellOMaps). Download slides from [GDC](https://portal.gdc.cancer.gov/).
 - DHMC slides: [Dartmouth Lung Cancer Histology Dataset](https://bmirds.github.io/LungCancer/). Evaluation also requires the study's region annotations and selected-slide manifest, which are separate from this repository.
 
 Labels: `0 acinar, 1 cribriform, 2 lepidic, 3 micropapillary, 4 papillary, 5 solid`.
@@ -73,13 +76,24 @@ MixSCon defaults: AdamW, learning rate 0.001, weight decay 0.0001, batch 32, max
 
 The CE/FL checkpoints use a ResNet-50 encoder, a 2048-to-128 linear projection and a six-class cosine classifier on pooled 2048-D features (temperature 0.07). Mixup operates on normalized projections. The training code initializes classifier weights with Kaiming normal initialization. The class-level reference uses an MLP classifier.
 
-CE/FL checkpoints are saved per fold using validation cross-entropy, with patience 30 and minimum improvement 0.0001. The MixSCon launcher keeps each fold separately; specify the evaluation checkpoint in the JSON below. The original final fold-selection criterion for manuscript results remains to be confirmed.
+The training scripts save one CE/FL checkpoint per fold using validation cross-entropy (patience 30; minimum improvement 0.0001). Select the checkpoint to evaluate in the JSON configuration below.
 
 Baseline learning rates (Adam): ViT 0.001, Alsubaie 0.0001, CellOMaps 0.00001, Ding 0.0001. Alsubaie uses RGB plus a downsampled/upsampled copy; Ding requires three fold-specific SSL checkpoints with ResNet-compatible keys. ResNet-50 is supported for evaluation. See `NOTICE` for method sources.
+
+Table VII uses two-stage training: an encoder trained with Adam, followed by an MLP trained with AdamW on the frozen encoder (both learning rates 0.001; classifier weight decay 0.0001). Manifold mixup is applied after ResNet layer 3. Encoder checkpoints use training loss; classifier checkpoints use validation accuracy.
+
+```bash
+python -m ablation.run_fair_ablation_study --data-root data/cv --output-dir outputs/ablation
+python -m ablation.run_fair_ablation_study_evaluate --cohort TCGA --data-root data/TCGA_tiles --model-root outputs/ablation --output-dir outputs/ablation_TCGA
+```
+
+Both commands accept `--folds 1`, `--experiments 1 2 3 4 5 6`, `--skip-tsne` and `--dry-run`. Model files are saved under `Round*/models/`; evaluation CSVs and plots under `Round*/results/`.
 
 ## Evaluation and WSI analysis
 
 Provide compatible weights separately. Copy `configs/checkpoints.example.json` to `weights/checkpoints.json` and replace its placeholder paths. Fill `splits/tiles.example.csv` locally as `data/AMC.csv`: unique `sample_id`, `label`, `raw_path`, and `cellmap_path` for CellOMaps. Paths are relative to the manifest directory. WSI analysis also needs `patient_id,wsi_id`.
+
+The `label` column accepts class names (e.g. `lepidic` or `3_lepidic`) or fixed IDs. TCGA uses `0,2,3,4,5`; do not use compact ImageFolder IDs `0..4`. The ablation evaluator applies `map_labels` automatically to folder names, including when Cribriform is absent.
 
 ```bash
 python evaluate.py --cohort AMC --manifest data/AMC.csv --checkpoint-config weights/checkpoints.json --weights-root weights --output-dir outputs/AMC --device cuda
@@ -98,6 +112,14 @@ Evaluation reports macro metrics; training summaries use weighted precision/F1. 
 
 Bootstrap resamples patches within each fixed WSI using shared indices across models. WSI predictions use mean probabilities; reference labels use the most frequent evaluated patch label, excluding ties. One WSI per patient is required. Percentile intervals describe patch-sampling variability within the observed cohort.
 
+For Fig. 4, use the prediction CSV from `evaluate.py` or the original CSV with `filename,pred,confidence score` columns:
+
+```bash
+python -m analysis.overlay_patch_wsi --wsi data/slide.mrxs --xml data/slide.xml --predictions outputs/AMC/mixscon_fl_tile_predictions.csv --output outputs/slide_overlay.png --image-level 3 --confidence-threshold 0.7 --patch-scale 5 --coordinate-origin center
+```
+
+These are the original Fig. 4 settings. Coordinates come from original `WSI_class_x_X_y_Y.png` filenames or explicit `wsi_id,x,y` columns (level-0 pixels; `wsi_id` matches the slide basename). For tiles from `preprocessing/`, use `--coordinate-origin top-left --patch-scale 1` to show their actual footprints. The script saves the overlay PNG and settings JSON.
+
 ## Outputs and manuscript mapping
 
 | Script | Main outputs | Manuscript |
@@ -107,8 +129,11 @@ Bootstrap resamples patches within each fixed WSI using shared indices across mo
 | `evaluate.py` | `point_estimates.csv`, per-class metrics, tile predictions, ROC and confusion matrices | Tables IV-VI, Fig. 2 |
 | `train_class_mixup.py`, `train_mixscon.py`, `evaluate.py` | Class/patient comparison metrics and ROC | Table IX, Fig. 3(b-d) |
 | `analysis.bootstrap`, `analysis.plot_wsi` | WSI metrics, paired differences, AUC plots | Tables R1-R3, Figs. R1-R2 |
+| `ablation.run_fair_ablation_study`, `ablation.run_fair_ablation_study_evaluate` | Encoder/classifier checkpoints, metrics, ROC and t-SNE | Table VII |
+| `analysis.overlay_patch_wsi` | WSI overlay PNG and settings JSON | Fig. 4 |
+| `evaluate.py` and Excel | Per-class AUCs and tile prediction CSVs | Fig. 3(a), Table X |
 
-For class-reference evaluation, add a `class_mixup` checkpoint to the JSON. Collaborator-held scripts for Table VII, Fig. 3(a), Fig. 4 and Table X will be added separately.
+For class-reference evaluation, add a `class_mixup` checkpoint to the JSON. Fig. 3(a) and Table X were prepared in Excel using per-class AUCs and prediction CSVs. The CSVs include filenames, true/predicted classes, confidence and all six probabilities.
 
 ## License and citation
 
